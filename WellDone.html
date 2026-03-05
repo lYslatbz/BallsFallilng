@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <title>转盘倒球模拟器 DEMO</title>
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-family: sans-serif;
+      background: #f5f5f5;
+    }
+
+    canvas {
+      border: 1px solid #ccc;
+      background: #fff;
+    }
+
+    #controls {
+      margin-top: 10px;
+    }
+
+    button {
+      padding: 5px 15px;
+      margin: 0 5px;
+      font-size: 16px;
+    }
+
+    #scoreDisplay {
+      font-size: 20px;
+      margin-bottom: 5px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h2>转盘倒球模拟器 DEMO</h2>
+  <div id="scoreDisplay">分数: <span id="score">100</span></div>
+  <canvas id="gameCanvas" width="600" height="600"></canvas>
+
+  <div id="controls">
+    <button id="dropBtn">Drop</button>
+    <button id="resetBtn">Reset</button>
+    <span>小球总数: <span id="ballCount">0</span></span>
+    <br><br>
+    <label>掉球数量: <input type="number" id="ballInput" value="3" min="1" max="20"></label>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.19.0/build/matter.min.js"></script>
+  <script>
+    const { Engine, World, Bodies, Body, Runner, Events, Constraint } = Matter;
+
+    const engine = Engine.create();
+
+    // 提高物理迭代次数（穿模减少）
+    engine.positionIterations = 10;   // 默认 6
+    engine.velocityIterations = 10;   // 默认 4
+    engine.constraintIterations = 4;  // 默认 2
+
+    // 创建 Runner，并提高刷新率
+    const runner = Runner.create({
+      delta: 1000 / 120   // 模拟 120Hz
+    });
+    Runner.run(runner, engine);
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width, height = canvas.height;
+    const centerX = width / 2, centerY = height / 2;
+    const radius = 200;
+    const slotCount = 16;
+
+    // 槽位数字
+    const slotValues = [0, 1, 2, 2, 3, 3, 1, 4, 4, 3, 2, 4, 6, 6,
+      0,
+      2];
+
+
+    // 槽位颜色
+    const slotColors = [
+      '#ccc', '#ccc', '#00f', '#00f', '#00f', '#00f', '#ccc', '#800080', '#800080', '#00f', '#00f', '#800080', '#ffa500', '#ffa500', '#ccc', '#00f'
+    ];
+
+    let balls = [];
+    //let constraints = [];
+    let score = 100;
+    // 新增：待生成小球的队列
+    let pendingSpawnTasks = [];
+
+    // 圆盘旋转状态
+    let diskAngle = 0;
+    let diskAngularVelocity = 0;
+    let isSpinning = false;
+
+    // 圆盘边缘碰撞环（保留原有反弹效果）
+    const edgeSegments = [];
+    const segmentCount = 64;
+    const thickness = 20;
+    for (let i = 0; i < segmentCount; i++) {
+      const angle = (2 * Math.PI / segmentCount) * i;
+      const x = centerX + Math.cos(angle) * radius;
+      const y = centerY + Math.sin(angle) * radius;
+      const w = 2 * Math.PI * radius / segmentCount + 2;
+      const h = thickness;
+      const rect = Bodies.rectangle(x, y, w, h, {
+        isStatic: true,
+        angle: angle,
+        restitution: 0.8,
+        friction: 0.05
+      });
+      edgeSegments.push(rect);
+    }
+    World.add(engine.world, edgeSegments);
+
+    // 每个扇形右侧垂直隔板
+    const slotSeparators = [];
+    const separatorThickness = 60;  // 长
+    const separatorLength = 5;    // 宽
+    // 修改 slotSeparators 数组的创建部分
+    // 修改 slotSeparators 数组的创建部分
+    for (let i = 0; i < slotCount; i++) {
+      const angle = (i + 1) * 2 * Math.PI / slotCount;
+      const outerRadius = radius;
+      const innerRadius = radius - separatorLength;
+      // 假设您希望隔板的内端固定在 innerRadius 处
+      const attachRadius = innerRadius; // 定位点半径
+      const halfLength = separatorLength / 2;
+      // 隔板几何中心到圆心的距离
+      const geometricCenterRadius = attachRadius + halfLength;
+
+      const x = centerX + Math.cos(angle) * geometricCenterRadius;
+      const y = centerY + Math.sin(angle) * geometricCenterRadius;
+
+      const rect = Bodies.rectangle(x, y, separatorThickness, separatorLength, {
+        isStatic: true,
+        angle: angle,
+        restitution: 1,
+        friction: 0.1
+      });
+      // 存储关键参数
+      rect.originalAngle = angle;
+      rect.originalRadius = geometricCenterRadius; // 存储几何中心半径
+      rect.attachRadius = attachRadius; // 新增：存储定位点半径
+      slotSeparators.push(rect);
+    }
+    World.add(engine.world, slotSeparators);
+
+    // slot文字位置
+    const slotPositions = [];
+    for (let i = 0; i < slotCount; i++) {
+      const angle = (2 * Math.PI / slotCount) * i + Math.PI / slotCount;
+      const tx = Math.cos(angle) * (radius - 30);
+      const ty = Math.sin(angle) * (radius - 30);
+      slotPositions.push({ dx: tx, dy: ty, occupied: false });
+    }
+
+    // Drop小球
+    function dropBalls() {
+      const ballCountInput = parseInt(document.getElementById('ballInput').value) || 1;
+      const ballRadius = 10;
+      diskAngularVelocity = 0.04 + Math.random() * 0.02;
+      isSpinning = true;
+      const y = centerY;
+      const totalWidth = (ballCountInput - 1) * (ballRadius * 2);
+      const startX = centerX - totalWidth / 2;
+
+      for (let i = 0; i < ballCountInput; i++) {
+        const x = startX + i * (ballRadius * 2);
+        const ball = Bodies.circle(x, y, ballRadius, {
+          restitution: 0.9,
+          friction: 0.05,
+          density: 0.2,
+          render: { fillStyle: '#f00' },
+          attachSlot: null,
+          ballType: 'red'
+        });
+        Body.setVelocity(ball, { x: 0, y: 0 });
+        balls.push(ball);
+        World.add(engine.world, ball);
+      }
+    }
+
+    // 新增函数：生成蓝色小球
+    function shootUpBalls(count, fromX, fromY) {
+      const ballRadius = 10;
+      for (let i = 0; i < count; i++) {
+        // 创建小球，颜色为蓝色，并标记类型为 'blue'
+        const newBall = Bodies.circle(fromX, fromY, ballRadius, {
+          restitution: 0.9,
+          friction: 0.05,
+          density: 0.2,
+          render: { fillStyle: '#00f' }, // 蓝色
+          attachSlot: null,
+          ballType: 'blue'  // 标记为蓝色小球
+        });
+        // 可选：如果希望蓝色小球有一点向上的初速度，取消下面这行注释
+        // Body.applyForce(newBall, newBall.position, { x: 0, y: -0.01 });
+        balls.push(newBall);
+        World.add(engine.world, newBall);
+      }
+    }
+
+    // Reset
+    function resetBalls() {
+      balls.forEach(b => World.remove(engine.world, b));
+      balls = [];
+      diskAngularVelocity = 0;
+      isSpinning = false;
+      diskAngle = 0;
+      slotPositions.forEach(slot => slot.occupied = false);
+      // constraints.forEach(c => World.remove(engine.world, c));
+      // constraints = [];
+
+      score = 100;
+      document.getElementById('score').innerText = score;
+      document.getElementById('ballCount').innerText = 0;
+      // 新增：清空待生成队列
+      pendingSpawnTasks = [];
+    }
+
+    // 更新计数器
+    Events.on(engine, 'afterUpdate', () => { document.getElementById('ballCount').innerText = balls.length; });
+
+    // 按钮绑定
+    document.getElementById('dropBtn').addEventListener('click', dropBalls);
+    document.getElementById('resetBtn').addEventListener('click', resetBalls);
+
+    // 弹出数字效果数组
+    const popupNumbers = [];
+    function addPopupNumber(value, x, y) {
+      popupNumbers.push({ value, x, y, life: 60 });
+    }
+
+    // 绘制循环
+    (function renderLoop() {
+      ctx.clearRect(0, 0, width, height);
+
+      // 圆盘旋转
+      if (isSpinning) {
+        diskAngle += diskAngularVelocity;
+        diskAngularVelocity *= 0.993;
+        if (diskAngularVelocity < 0.001) {
+          diskAngularVelocity = 0;
+          isSpinning = false;
+          // ===== 修改：转盘停止时，在对应槽位位置生成小球 =====
+          if (pendingSpawnTasks.length > 0) {
+            pendingSpawnTasks.forEach(task => {
+              // 1. 根据槽位索引获取槽位相对位置
+              const slot = slotPositions[task.slotIndex];
+              // 2. 计算该槽位在转盘停止后的世界坐标
+              const spawnX = centerX
+                + slot.dx * Math.cos(diskAngle)
+                - slot.dy * Math.sin(diskAngle);
+              const spawnY = centerY
+                + slot.dx * Math.sin(diskAngle)
+                + slot.dy * Math.cos(diskAngle);
+              // 3. 在计算出的槽位位置生成蓝色小球
+              shootUpBalls(task.count, spawnX, spawnY);
+            });
+            // 清空任务队列
+            pendingSpawnTasks = [];
+          }
+          // ===== 新增结束 =====
+        }
+      }
+
+      // 更新约束固定端
+      // for (let i = 0; i < constraints.length; i++) {
+      //   const c = constraints[i];
+      //   const ball = c.bodyB;
+      //   if (ball.attachSlot !== null) {
+      //     const slot = slotPositions[ball.attachSlot];
+      //     c.pointA.x = centerX + slot.dx * Math.cos(diskAngle) - slot.dy * Math.sin(diskAngle);
+      //     c.pointA.y = centerY + slot.dx * Math.sin(diskAngle) + slot.dy * Math.cos(diskAngle);
+      //   }
+      // }
+      // ===== 新增：根据当前圆盘角度，同步更新所有隔板的位置和角度 =====
+      // 在 renderLoop 中更新隔板位置
+      slotSeparators.forEach(sep => {
+        const newX = centerX + Math.cos(sep.originalAngle + diskAngle) * sep.originalRadius;
+        const newY = centerY + Math.sin(sep.originalAngle + diskAngle) * sep.originalRadius;
+        const newAngle = sep.originalAngle + diskAngle;
+        Body.setPosition(sep, { x: newX, y: newY });
+        Body.setAngle(sep, newAngle);
+      });
+      // ===== 新增结束 =====
+
+      // 小球吸附或自由运动
+      balls.forEach(ball => {
+
+        // ===== 新增：类型判断 =====
+        // 如果是蓝色小球，则跳过整个吸附检测流程，直接进入“自由运动”环节。
+        if (ball.ballType === 'blue') {
+          // 蓝色小球直接进行自由运动计算，不尝试吸附
+          const dx = ball.position.x - centerX;
+          const dy = ball.position.y - centerY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const targetRadius = radius - 20;
+          const forceStrength = 0.0005;
+          const fy = (dy / dist) * (targetRadius - dist) * forceStrength;
+          Body.applyForce(ball, ball.position, { x: 0, y: fy });
+          return; // 直接返回，不再执行后续的吸附检测
+        }
+
+        // ===== 已吸附的小球 =====
+        if (ball.attachSlot !== null) {
+
+          const slot = slotPositions[ball.attachSlot];
+
+          const x = centerX
+            + slot.dx * Math.cos(diskAngle)
+            - slot.dy * Math.sin(diskAngle);
+
+          const y = centerY
+            + slot.dx * Math.sin(diskAngle)
+            + slot.dy * Math.cos(diskAngle);
+
+          Body.setVelocity(ball, { x: 0, y: 0 });
+          Body.setAngularVelocity(ball, 0);
+          Body.setPosition(ball, { x, y });
+          Body.setAngle(ball, diskAngle);
+
+          return;
+        }
+
+        // ===== 未吸附 → 检测是否进入槽位 =====
+        let attached = false;
+
+        for (let i = 0; i < slotCount; i++) {
+
+          const slot = slotPositions[i];
+          if (slot.occupied) continue;
+
+          const slotX = centerX
+            + slot.dx * Math.cos(diskAngle)
+            - slot.dy * Math.sin(diskAngle);
+
+          const slotY = centerY
+            + slot.dx * Math.sin(diskAngle)
+            + slot.dy * Math.cos(diskAngle);
+
+          const dx = ball.position.x - slotX;
+          const dy = ball.position.y - slotY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          if (dist < 10) {
+
+            slot.occupied = true;
+            ball.attachSlot = i;
+
+            Body.setVelocity(ball, { x: 0, y: 0 });
+            Body.setAngularVelocity(ball, 0);
+
+            const val = slotValues[i];
+            score *= val;
+            document.getElementById('score').innerText = score;
+            addPopupNumber(val, ball.position.x, ball.position.y);
+
+            // ===== 新增：根据小球类型决定行为 =====
+            if (ball.ballType === 'red') {
+              // 不立即生成，而是记录任务
+              pendingSpawnTasks.push({
+                count: val,
+                slotIndex: i,  // 新增：存储是哪个槽位
+
+              });
+            }
+            // ===== 修改结束 =====
+            attached = true;
+            break;
+          }
+        }
+
+        // ===== 自由运动 =====
+        if (!attached) {
+
+          const dx = ball.position.x - centerX;
+          const dy = ball.position.y - centerY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+
+          const targetRadius = radius - 20;
+          const forceStrength = 0.0005;
+
+          const fy = (dy / dist) * (targetRadius - dist) * forceStrength;
+
+          Body.applyForce(ball, ball.position, { x: 0, y: fy });
+        }
+
+      });
+
+      // 绘制圆盘扇形
+      ctx.save();
+      ctx.translate(centerX, centerY);
+      ctx.rotate(diskAngle);
+      for (let i = 0; i < slotCount; i++) {
+        const startAngle = (2 * Math.PI / slotCount) * i;
+        const endAngle = startAngle + 2 * Math.PI / slotCount;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.arc(0, 0, radius, startAngle, endAngle);
+        ctx.closePath();
+        ctx.fillStyle = slotColors[i];
+        ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+
+      // 绘制扇形右侧垂直隔板
+      // 绘制扇形右侧垂直隔板
+      slotSeparators.forEach(sep => {
+        ctx.save();
+        // 1. 在“圆盘坐标系”下，移动到隔板相对于圆盘中心的原始位置
+        // 注意：这里使用的是隔板的原始相对坐标
+        ctx.translate(
+          Math.cos(sep.originalAngle) * sep.originalRadius,
+          Math.sin(sep.originalAngle) * sep.originalRadius
+        );
+        // 2. 应用隔板自身的原始角度
+        ctx.rotate(sep.originalAngle);
+        // 3. 绘制矩形
+        ctx.fillStyle = '#555';
+        ctx.fillRect(-separatorThickness / 2, -separatorLength / 2, separatorThickness, separatorLength);
+        ctx.restore();
+      });
+      // 绘制文字
+      for (let i = 0; i < slotCount; i++) {
+        const slot = slotPositions[i];
+        ctx.fillStyle = '#000';
+        ctx.font = '16px sans-serif';
+        ctx.fillText(slotValues[i], slot.dx - 10, slot.dy + 5);
+      }
+      ctx.restore();
+
+      // 绘制小球
+      balls.forEach(ball => {
+        ctx.beginPath();
+        ctx.arc(ball.position.x, ball.position.y, 10, 0, 2 * Math.PI);
+        ctx.fillStyle = '#f00';
+        ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.stroke();
+      });
+
+      // 绘制弹出数字
+      for (let i = popupNumbers.length - 1; i >= 0; i--) {
+        const p = popupNumbers[i];
+        ctx.font = '36px sans-serif';
+        ctx.fillStyle = '#ff0';
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 2;
+        ctx.strokeText('*' + p.value, p.x, p.y);
+        ctx.fillText('*' + p.value, p.x, p.y);
+        p.y -= 1;
+        p.life -= 1;
+        if (p.life <= 0) popupNumbers.splice(i, 1);
+      }
+
+      requestAnimationFrame(renderLoop);
+    })();
+  </script>
+
+</body>
+
+</html>
